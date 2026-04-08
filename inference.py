@@ -11,7 +11,7 @@ API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 BENCHMARK = "support-triage-env"
-SPACE_URL = os.getenv("SPACE_URL", "http://127.0.0.1:7860") # Local or HF Space URL
+SPACE_URL = os.getenv("SPACE_URL", "http://127.0.0.1:7860") 
 MAX_STEPS = 10
 TEMPERATURE = 0.1
 
@@ -21,7 +21,7 @@ SYSTEM_PROMPT = textwrap.dedent(
     Valid departments: 'billing', 'tech_support', 'sales'.
     Reply in strictly valid JSON format matching this schema:
     {"ticket_id": "T1", "department": "billing"}
-    Do not route multiple tickets. Only pick ONE ticket to route right now.
+    Only pick ONE ticket to route right now.
     """
 ).strip()
 
@@ -50,72 +50,76 @@ def get_model_action(client: OpenAI, obs: dict) -> dict:
             response_format={"type": "json_object"}
         )
         response_text = completion.choices[0].message.content
+        
+        # Clean up any potential markdown formatting from the AI (e.g., ```json ... ```)
+        response_text = response_text.replace("```json", "").replace("```", "").strip()
         response = json.loads(response_text)
         
-        # SAFETY FILTER: Ensure the server gets exactly what it expects
         if isinstance(response, list) and len(response) > 0:
-            # If the AI accidentally returned a list, grab the first item
             response = response[0]
             
-        if isinstance(response, dict):
-            return {
-                "ticket_id": str(response.get("ticket_id", "T1")),
-                "department": str(response.get("department", "billing"))
-            }
-        
-        # Fallback if the AI returned something totally weird
-        return {"ticket_id": "T1", "department": "billing"}
+        return {
+            "ticket_id": str(response.get("ticket_id", "T1")),
+            "department": str(response.get("department", "billing"))
+        }
         
     except Exception as e:
-        # Fallback to prevent crash if Hugging Face API errors out
+        print(f"[DEBUG] AI Parsing/API Error: {e}")
+        # Return a safe fallback to prevent the script from crashing
         return {"ticket_id": "T1", "department": "billing"}
 
 async def run_task(task_name: str):
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-    
     rewards = []
     steps_taken = 0
-    success = False
     
     log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
     
-    # Reset Environment
-    reset_res = requests.post(f"{SPACE_URL}/reset", json={"task_id": task_name}).json()
-    obs = reset_res["observation"]
-    
-    for step in range(1, MAX_STEPS + 1):
-        action_payload = get_model_action(client, obs)
-        action_str = json.dumps(action_payload).replace(" ", "")
+    try:
+        # Reset Environment with a timeout (Hugging Face can be slow to wake up)
+        reset_response = requests.post(f"{SPACE_URL}/reset", json={"task_id": task_name}, timeout=20)
+        reset_response.raise_for_status()
+        reset_res = reset_response.json()
         
-        # Step Environment
-        step_response = requests.post(f"{SPACE_URL}/step", json=action_payload)
-        
-        # SAFETY CHECK: If the server crashed or rejected the input, stop the loop safely
-        if step_response.status_code != 200:
-            print(f"\n[DEBUG] Server Error: {step_response.text}\n", flush=True)
-            log_step(step=step, action=action_str, reward=0.0, done=True, error=f"HTTP {step_response.status_code}")
-            break
+        if "observation" not in reset_res:
+            raise KeyError("The server reset response is missing the 'observation' key.")
             
-        step_res = step_response.json()
+        obs = reset_res["observation"]
         
-        obs = step_res["observation"]
-        reward = float(step_res["reward"])
-        done = step_res["done"]
-        error = step_res.get("info", {}).get("error")
-        
-        rewards.append(reward)
-        steps_taken = step
-        
-        log_step(step=step, action=action_str, reward=reward, done=done, error=error)
-        
-        if done:
-            break
+        for step in range(1, MAX_STEPS + 1):
+            action_payload = get_model_action(client, obs)
+            action_str = json.dumps(action_payload).replace(" ", "")
             
-    score = sum(rewards)
-    score = min(max(score, 0.0), 1.0) # Clamp 0-1
-    success = score >= 0.99
-    
-    log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+            # Step Environment with timeout
+            step_response = requests.post(f"{SPACE_URL}/step", json=action_payload, timeout=10)
+            
+            if step_response.status_code != 200:
+                print(f"\n[DEBUG] Server Error: {step_response.text}\n", flush=True)
+                log_step(step=step, action=action_str, reward=0.0, done=True, error=f"HTTP {step_response.status_code}")
+                break
+                
+            step_res = step_response.json()
+            
+            # Use .get() to avoid KeyErrors if the server response is malformed
+            obs = step_res.get("observation", {})
+            reward = float(step_res.get("reward", 0.0))
+            done = step_res.get("done", True)
+            error = step_res.get("info", {}).get("error")
+            
+            rewards.append(reward)
+            steps_taken = step
+            log_step(step=step, action=action_str, reward=reward, done=done, error=error)
+            
+            if done:
+                break
+                
+        score = min(max(sum(rewards), 0.0), 1.0)
+        log_end(success=(score >= 0.99), steps=steps_taken, score=score, rewards=rewards)
+
+    except requests.exceptions.RequestException as e:
+        print(f"[ERROR] Connection to Space failed: {e}")
+    except Exception as e:
+        print(f"[ERROR] Unexpected error in run_task: {e}")
 
 async def main():
     tasks = ["triage-easy", "triage-medium", "triage-hard"]
