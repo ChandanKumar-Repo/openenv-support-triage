@@ -1,0 +1,11 @@
+version: "1.0"
+name: "SupportTriageEnv"
+description: "A real-world environment where agents triage and route customer support tickets."
+entrypoint: "server.main:app"
+tasks:
+  - id: "triage-easy"
+    description: "Route a single clear support ticket."
+  - id: "triage-medium"
+    description: "Route three tickets with mixed contexts."
+  - id: "triage-hard"
+    description: "Route five tickets including vague complaints and urgent requests."
