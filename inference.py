@@ -113,7 +113,10 @@ async def run_task(task_name: str):
             if done:
                 break
                 
-        score = min(max(sum(rewards), 0.0), 1.0)
+        # Ensures score is strictly > 0 and < 1
+        score = min(max(sum(rewards), 0.001), 0.999)
+        # ------------------------------------
+        
         log_end(success=(score >= 0.99), steps=steps_taken, score=score, rewards=rewards)
 
     except requests.exceptions.RequestException as e:
